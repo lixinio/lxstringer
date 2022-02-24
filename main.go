@@ -79,18 +79,33 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
 
+const (
+	DefCodeIndex  = "CodeIndex"
+	DefNameIndex  = "NameIndex"
+	DefCodeMap    = "CodeMap"
+	DefNameMap    = "NameMap"
+	DefCode2IDMap = "Code2IDMap"
+	DefCodeVal    = "CodeName"
+	DefNameVal    = "Name"
+	DefCodeFn     = "Code"
+	DefNameFn     = "Name"
+	DefCode2IDFn  = "CodeTo"
+)
+
 var (
-	typeNames   = flag.String("type", "", "comma-separated list of type names; must be set")
-	output      = flag.String("output", "", "output file name; default srcdir/<type>_string.go")
-	trimprefix  = flag.String("trimprefix", "", "trim the `prefix` from the generated constant names")
-	linecomment = flag.Bool("linecomment", false, "use line comment text as printed text when present")
-	buildTags   = flag.String("tags", "", "comma-separated list of build tags to apply")
+	typeNames     = flag.String("type", "", "comma-separated list of type names; must be set")
+	output        = flag.String("output", "", "output file name; default srcdir/<type>_string.go")
+	buildTags     = flag.String("tags", "", "comma-separated list of build tags to apply")
+	codeFnName    = flag.String("code", "Code", "code函数名")
+	nameFnName    = flag.String("name", "Name", "name函数名")
+	code2IDFnName = flag.String("code2id", "", "code转id函数名")
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -129,9 +144,19 @@ func main() {
 	// Parse the package once.
 	var dir string
 	g := Generator{
-		trimPrefix:  *trimprefix,
-		lineComment: *linecomment,
+		codeFnName:    *codeFnName,
+		nameFnName:    *nameFnName,
+		code2IDFnName: *code2IDFnName,
 	}
+	g.codeFnName = *codeFnName
+	if g.codeFnName == "" {
+		g.codeFnName = DefCodeFn
+	}
+	g.nameFnName = *nameFnName
+	if g.nameFnName == "" {
+		g.nameFnName = DefNameFn
+	}
+
 	// TODO(suzmue): accept other patterns for packages (directories, list of files, import paths, etc).
 	if len(args) == 1 && isDirectory(args[0]) {
 		dir = args[0]
@@ -154,6 +179,7 @@ func main() {
 	// Run generate for each type.
 	for _, typeName := range types {
 		g.generate(typeName)
+		g.Printf("\n")
 	}
 
 	// Format the output.
@@ -186,8 +212,9 @@ type Generator struct {
 	buf bytes.Buffer // Accumulated output.
 	pkg *Package     // Package we are scanning.
 
-	trimPrefix  string
-	lineComment bool
+	codeFnName    string
+	nameFnName    string
+	code2IDFnName string
 }
 
 func (g *Generator) Printf(format string, args ...interface{}) {
@@ -201,9 +228,6 @@ type File struct {
 	// These fields are reset for each type being generated.
 	typeName string  // Name of the constant type.
 	values   []Value // Accumulator for constant values of that type.
-
-	trimPrefix  string
-	lineComment bool
 }
 
 type Package struct {
@@ -242,10 +266,8 @@ func (g *Generator) addPackage(pkg *packages.Package) {
 
 	for i, file := range pkg.Syntax {
 		g.pkg.files[i] = &File{
-			file:        file,
-			pkg:         g.pkg,
-			trimPrefix:  g.trimPrefix,
-			lineComment: g.lineComment,
+			file: file,
+			pkg:  g.pkg,
 		}
 	}
 }
@@ -291,10 +313,13 @@ func (g *Generator) generate(typeName string) {
 	switch {
 	case len(runs) == 1:
 		g.buildOneRun(runs, typeName)
+		g.code2ID(runs, typeName)
 	case len(runs) <= 10:
 		g.buildMultipleRuns(runs, typeName)
+		g.code2ID2(runs, typeName)
 	default:
 		g.buildMap(runs, typeName)
+		g.code2ID(runs, typeName)
 	}
 }
 
@@ -346,7 +371,8 @@ func (g *Generator) format() []byte {
 // Value represents a declared constant.
 type Value struct {
 	originalName string // The name of the constant.
-	name         string // The name with trimmed prefix.
+	codeName     string // The name with trimmed prefix.
+	cnName       string
 	// The value is stored as a bit pattern alone. The boolean tells us
 	// whether to interpret it as an int64 or a uint64; the only place
 	// this matters is when sorting.
@@ -359,6 +385,14 @@ type Value struct {
 
 func (v *Value) String() string {
 	return v.str
+}
+
+func ValueCode(v *Value) string {
+	return v.codeName
+}
+
+func ValueName(v *Value) string {
+	return v.cnName
 }
 
 // byValue lets us sort the constants into increasing order.
@@ -459,10 +493,21 @@ func (f *File) genDecl(node ast.Node) bool {
 				signed:       info&types.IsUnsigned == 0,
 				str:          value.String(),
 			}
-			if c := vspec.Comment; f.lineComment && c != nil && len(c.List) == 1 {
-				v.name = strings.TrimSpace(c.Text())
-			} else {
-				v.name = strings.TrimPrefix(v.originalName, f.trimPrefix)
+			if c := vspec.Comment; c != nil && len(c.List) == 1 {
+				r := regexp.MustCompile(`[^\s"]+|"([^"]*)"`)
+				names := r.FindAllString(strings.TrimSpace(c.Text()), -1)
+				if len(names) > 0 {
+					v.codeName = strings.Trim(names[0], "\"")
+				}
+				if len(names) > 1 {
+					v.cnName = strings.Trim(names[1], "\"")
+				}
+			}
+			if v.cnName == "" {
+				v.cnName = v.originalName
+			}
+			if v.codeName == "" {
+				v.codeName = v.originalName
 			}
 			f.values = append(f.values, v)
 		}
@@ -492,11 +537,11 @@ func usize(n int) int {
 func (g *Generator) declareIndexAndNameVars(runs [][]Value, typeName string) {
 	var indexes, names []string
 	for i, run := range runs {
-		index, name := g.createIndexAndNameDecl(run, typeName, fmt.Sprintf("_%d", i))
+		indexs, namex := g.createIndexAndNameDecl(run, typeName, fmt.Sprintf("_%d", i))
 		if len(run) != 1 {
-			indexes = append(indexes, index)
+			indexes = append(indexes, indexs[0], indexs[1])
 		}
-		names = append(names, name)
+		names = append(names, namex[0], namex[1])
 	}
 	g.Printf("const (\n")
 	for _, name := range names {
@@ -515,42 +560,66 @@ func (g *Generator) declareIndexAndNameVars(runs [][]Value, typeName string) {
 
 // declareIndexAndNameVar is the single-run version of declareIndexAndNameVars
 func (g *Generator) declareIndexAndNameVar(run []Value, typeName string) {
-	index, name := g.createIndexAndNameDecl(run, typeName, "")
-	g.Printf("const %s\n", name)
-	g.Printf("var %s\n", index)
+	indexs, names := g.createIndexAndNameDecl(run, typeName, "")
+	g.Printf("const (\n")
+	g.Printf("%s\n", names[0])
+	g.Printf("%s\n", names[1])
+	g.Printf(")\n\n")
+
+	g.Printf("var (\n")
+	g.Printf("%s\n", indexs[0])
+	g.Printf("%s\n", indexs[1])
+	g.Printf(")\n\n")
 }
 
 // createIndexAndNameDecl returns the pair of declarations for the run. The caller will add "const" and "var".
-func (g *Generator) createIndexAndNameDecl(run []Value, typeName string, suffix string) (string, string) {
-	b := new(bytes.Buffer)
-	indexes := make([]int, len(run))
-	for i := range run {
-		b.WriteString(run[i].name)
-		indexes[i] = b.Len()
-	}
-	nameConst := fmt.Sprintf("_%s_name%s = %q", typeName, suffix, b.String())
-	nameLen := b.Len()
-	b.Reset()
-	fmt.Fprintf(b, "_%s_index%s = [...]uint%d{0, ", typeName, suffix, usize(nameLen))
-	for i, v := range indexes {
-		if i > 0 {
-			fmt.Fprintf(b, ", ")
+func (g *Generator) createIndexAndNameDecl(
+	run []Value,
+	typeName string,
+	suffix string,
+) ([2]string, [2]string) {
+	f := func(nameKey, indexKey string, fn func(*Value) string) (string, string) {
+		b := new(bytes.Buffer)
+		indexes := make([]int, len(run))
+		for i := range run {
+			b.WriteString(fn(&run[i]))
+			indexes[i] = b.Len()
 		}
-		fmt.Fprintf(b, "%d", v)
+		nameConst := fmt.Sprintf("_%s%s%s = %q", typeName, nameKey, suffix, b.String())
+		nameLen := b.Len()
+
+		b.Reset()
+		fmt.Fprintf(b, "_%s%s%s = [...]uint%d{0, ", typeName, indexKey, suffix, usize(nameLen))
+		for i, v := range indexes {
+			if i > 0 {
+				fmt.Fprintf(b, ", ")
+			}
+			fmt.Fprintf(b, "%d", v)
+		}
+		fmt.Fprintf(b, "}")
+		return b.String(), nameConst
 	}
-	fmt.Fprintf(b, "}")
-	return b.String(), nameConst
+
+	idx1, name1 := f(DefCodeVal, DefCodeIndex, ValueCode)
+	idx2, name2 := f(DefNameVal, DefNameIndex, ValueName)
+	return [2]string{idx1, idx2}, [2]string{name1, name2}
 }
 
 // declareNameVars declares the concatenated names string representing all the values in the runs.
 func (g *Generator) declareNameVars(runs [][]Value, typeName string, suffix string) {
-	g.Printf("const _%s_name%s = \"", typeName, suffix)
-	for _, run := range runs {
-		for i := range run {
-			g.Printf("%s", run[i].name)
+	g.Printf("const (\n")
+	f := func(nameKey string, fn func(*Value) string) {
+		g.Printf("\t_%s%s%s = \"", typeName, nameKey, suffix)
+		for _, run := range runs {
+			for i := range run {
+				g.Printf("%s", fn(&run[i]))
+			}
 		}
+		g.Printf("\"\n")
 	}
-	g.Printf("\"\n")
+	f(DefCodeVal, ValueCode)
+	f(DefNameVal, ValueName)
+	g.Printf(")\n")
 }
 
 // buildOneRun generates the variables and String method for a single run of contiguous values.
@@ -564,9 +633,25 @@ func (g *Generator) buildOneRun(runs [][]Value, typeName string) {
 		lessThanZero = "i < 0 || "
 	}
 	if values[0].value == 0 { // Signed or unsigned, 0 is still 0.
-		g.Printf(stringOneRun, typeName, usize(len(values)), lessThanZero)
+		g.Printf(
+			stringOneRun, typeName, usize(len(values)), lessThanZero,
+			g.codeFnName, DefCodeVal, DefCodeIndex,
+		)
+		g.Printf("\n")
+		g.Printf(
+			stringOneRun, typeName, usize(len(values)), lessThanZero,
+			g.nameFnName, DefNameVal, DefNameIndex,
+		)
 	} else {
-		g.Printf(stringOneRunWithOffset, typeName, values[0].String(), usize(len(values)), lessThanZero)
+		g.Printf(
+			stringOneRunWithOffset, typeName, values[0].String(), usize(len(values)),
+			lessThanZero, g.codeFnName, DefCodeVal, DefCodeIndex,
+		)
+		g.Printf("\n")
+		g.Printf(
+			stringOneRunWithOffset, typeName, values[0].String(), usize(len(values)),
+			lessThanZero, g.nameFnName, DefNameVal, DefNameIndex,
+		)
 	}
 }
 
@@ -574,11 +659,11 @@ func (g *Generator) buildOneRun(runs [][]Value, typeName string) {
 //	[1]: type name
 //	[2]: size of index element (8 for uint8 etc.)
 //	[3]: less than zero check (for signed types)
-const stringOneRun = `func (i %[1]s) String() string {
-	if %[3]si >= %[1]s(len(_%[1]s_index)-1) {
+const stringOneRun = `func (i %[1]s) %[4]s() string {
+	if %[3]si >= %[1]s(len(_%[1]s%[6]s)-1) {
 		return "%[1]s(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _%[1]s_name[_%[1]s_index[i]:_%[1]s_index[i+1]]
+	return _%[1]s%[5]s[_%[1]s%[6]s[i]:_%[1]s%[6]s[i+1]]
 }
 `
 
@@ -589,12 +674,12 @@ const stringOneRun = `func (i %[1]s) String() string {
 //	[4]: less than zero check (for signed types)
 /*
  */
-const stringOneRunWithOffset = `func (i %[1]s) String() string {
+const stringOneRunWithOffset = `func (i %[1]s) %[5]s() string {
 	i -= %[2]s
-	if %[4]si >= %[1]s(len(_%[1]s_index)-1) {
+	if %[4]si >= %[1]s(len(_%[1]s%[7]s)-1) {
 		return "%[1]s(" + strconv.FormatInt(int64(i + %[2]s), 10) + ")"
 	}
-	return _%[1]s_name[_%[1]s_index[i] : _%[1]s_index[i+1]]
+	return _%[1]s%[6]s[_%[1]s%[7]s[i] : _%[1]s%[7]s[i+1]]
 }
 `
 
@@ -603,30 +688,38 @@ const stringOneRunWithOffset = `func (i %[1]s) String() string {
 func (g *Generator) buildMultipleRuns(runs [][]Value, typeName string) {
 	g.Printf("\n")
 	g.declareIndexAndNameVars(runs, typeName)
-	g.Printf("func (i %s) String() string {\n", typeName)
-	g.Printf("\tswitch {\n")
-	for i, values := range runs {
-		if len(values) == 1 {
-			g.Printf("\tcase i == %s:\n", &values[0])
-			g.Printf("\t\treturn _%s_name_%d\n", typeName, i)
-			continue
+
+	f := func(funcName, nameKey, indexKey string) {
+		g.Printf("func (i %s) %s() string {\n", typeName, funcName)
+		g.Printf("\tswitch {\n")
+		for i, values := range runs {
+			if len(values) == 1 {
+				g.Printf("\tcase i == %s:\n", &values[0])
+				g.Printf("\t\treturn _%s%s_%d\n", typeName, nameKey, i)
+				continue
+			}
+			if values[0].value == 0 && !values[0].signed {
+				// For an unsigned lower bound of 0, "0 <= i" would be redundant.
+				g.Printf("\tcase i <= %s:\n", &values[len(values)-1])
+			} else {
+				g.Printf("\tcase %s <= i && i <= %s:\n", &values[0], &values[len(values)-1])
+			}
+			if values[0].value != 0 {
+				g.Printf("\t\ti -= %s\n", &values[0])
+			}
+			g.Printf(
+				"\t\treturn _%s%s_%d[_%s%s_%d[i]:_%s%s_%d[i+1]]\n",
+				typeName, nameKey, i, typeName, indexKey, i, typeName, indexKey, i,
+			)
 		}
-		if values[0].value == 0 && !values[0].signed {
-			// For an unsigned lower bound of 0, "0 <= i" would be redundant.
-			g.Printf("\tcase i <= %s:\n", &values[len(values)-1])
-		} else {
-			g.Printf("\tcase %s <= i && i <= %s:\n", &values[0], &values[len(values)-1])
-		}
-		if values[0].value != 0 {
-			g.Printf("\t\ti -= %s\n", &values[0])
-		}
-		g.Printf("\t\treturn _%s_name_%d[_%s_index_%d[i]:_%s_index_%d[i+1]]\n",
-			typeName, i, typeName, i, typeName, i)
+		g.Printf("\tdefault:\n")
+		g.Printf("\t\treturn \"%s(\" + strconv.FormatInt(int64(i), 10) + \")\"\n", typeName)
+		g.Printf("\t}\n")
+		g.Printf("}\n")
 	}
-	g.Printf("\tdefault:\n")
-	g.Printf("\t\treturn \"%s(\" + strconv.FormatInt(int64(i), 10) + \")\"\n", typeName)
-	g.Printf("\t}\n")
-	g.Printf("}\n")
+	f(g.codeFnName, DefCodeVal, DefCodeIndex)
+	g.Printf("\n")
+	f(g.nameFnName, DefNameVal, DefNameIndex)
 }
 
 // buildMap handles the case where the space is so sparse a map is a reasonable fallback.
@@ -634,23 +727,79 @@ func (g *Generator) buildMultipleRuns(runs [][]Value, typeName string) {
 func (g *Generator) buildMap(runs [][]Value, typeName string) {
 	g.Printf("\n")
 	g.declareNameVars(runs, typeName, "")
-	g.Printf("\nvar _%s_map = map[%s]string{\n", typeName, typeName)
-	n := 0
-	for _, values := range runs {
-		for _, value := range values {
-			g.Printf("\t%s: _%s_name[%d:%d],\n", &value, typeName, n, n+len(value.name))
-			n += len(value.name)
+	f := func(mapName, nameKey string, fn func(*Value) string) {
+		g.Printf("\nvar _%s%s = map[%s]string{\n", typeName, mapName, typeName)
+		n := 0
+		for _, values := range runs {
+			for _, value := range values {
+				g.Printf("\t%s: _%s%s[%d:%d],\n", &value, typeName, nameKey, n, n+len(fn(&value)))
+				n += len(fn(&value))
+			}
 		}
+		g.Printf("}\n\n")
 	}
-	g.Printf("}\n\n")
-	g.Printf(stringMap, typeName)
+	f(DefCodeMap, DefCodeVal, ValueCode)
+	f(DefNameMap, DefNameVal, ValueName)
+	g.Printf(stringMap, typeName, g.codeFnName, DefCodeMap)
+	g.Printf("\n")
+	g.Printf(stringMap, typeName, g.nameFnName, DefNameMap)
 }
 
 // Argument to format is the type name.
-const stringMap = `func (i %[1]s) String() string {
-	if str, ok := _%[1]s_map[i]; ok {
+const stringMap = `func (i %[1]s) %[2]s() string {
+	if str, ok := _%[1]s%[3]s[i]; ok {
 		return str
 	}
 	return "%[1]s(" + strconv.FormatInt(int64(i), 10) + ")"
+}
+`
+
+func (g *Generator) code2ID(runs [][]Value, typeName string) {
+	g.Printf("\n")
+	g.Printf("\nvar _%s%s = map[string]%s{\n", typeName, DefCode2IDMap, typeName)
+	n := 0
+	for _, values := range runs {
+		for _, value := range values {
+			g.Printf("\t_%s%s[%d:%d]: %s,\n", typeName, DefCodeVal, n, n+len(ValueCode(&value)), &value)
+			n += len(ValueCode(&value))
+		}
+	}
+
+	fnName := g.code2IDFnName
+	if fnName == "" {
+		fnName = fmt.Sprintf("%s%s", DefCode2IDFn, typeName)
+	}
+
+	g.Printf("}\n\n")
+	g.Printf(stringCode2IDMap, typeName, fnName, DefCode2IDMap)
+	g.Printf("\n")
+}
+
+func (g *Generator) code2ID2(runs [][]Value, typeName string) {
+	g.Printf("\n")
+	g.Printf("\nvar _%s%s = map[string]%s{\n", typeName, DefCode2IDMap, typeName)
+	n := 0
+	for i, values := range runs {
+		for _, value := range values {
+			g.Printf("\t_%s%s_%d: %s,\n", typeName, DefCodeVal, i, &value)
+			n += len(ValueCode(&value))
+		}
+	}
+
+	fnName := g.code2IDFnName
+	if fnName == "" {
+		fnName = fmt.Sprintf("%s%s", DefCode2IDFn, typeName)
+	}
+
+	g.Printf("}\n\n")
+	g.Printf(stringCode2IDMap, typeName, fnName, DefCode2IDMap)
+	g.Printf("\n")
+}
+
+const stringCode2IDMap = `func %[2]s(code string, dftVal %[1]s) %[1]s {
+	if val, ok := _%[1]s%[3]s[code]; ok {
+		return val
+	}
+	return dftVal
 }
 `
