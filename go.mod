@@ -1,4 +1,4 @@
-module xxx
+module github.com/lixinio/lxstringer
 
 go 1.15
 
