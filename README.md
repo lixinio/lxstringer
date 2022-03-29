@@ -106,4 +106,6 @@ func TestS11(t *testing.T) {
 + -code Code函数的名称，默认`Code`
 + -name Name函数的名称，默认`Name`
 + -code2id Code转枚举函数的名称，默认`CodeTo$Type$` 例如`CodeToS11`
+  + 如果`-code2id=-` 会跳过生成
 + -output 输出文件， 默认是当前目录的`$OriginFileName$_string.go`
++ -skipcode code和name都取第一列， 适用不关心code， 只关心name的情形
