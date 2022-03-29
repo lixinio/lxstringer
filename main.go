@@ -105,7 +105,8 @@ var (
 	buildTags     = flag.String("tags", "", "comma-separated list of build tags to apply")
 	codeFnName    = flag.String("code", "Code", "code函数名")
 	nameFnName    = flag.String("name", "Name", "name函数名")
-	code2IDFnName = flag.String("code2id", "", "code转id函数名")
+	code2IDFnName = flag.String("code2id", "", "code转id函数名, 如果是`-`则不生成相关代码逻辑")
+	skipCode      = flag.Bool("skipcode", false, "code转id函数名， 跳过code（code，name都取第一个字段）")
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -147,6 +148,7 @@ func main() {
 		codeFnName:    *codeFnName,
 		nameFnName:    *nameFnName,
 		code2IDFnName: *code2IDFnName,
+		skipCode:      *skipCode,
 	}
 	g.codeFnName = *codeFnName
 	if g.codeFnName == "" {
@@ -215,6 +217,7 @@ type Generator struct {
 	codeFnName    string
 	nameFnName    string
 	code2IDFnName string
+	skipCode      bool
 }
 
 func (g *Generator) Printf(format string, args ...interface{}) {
@@ -228,6 +231,7 @@ type File struct {
 	// These fields are reset for each type being generated.
 	typeName string  // Name of the constant type.
 	values   []Value // Accumulator for constant values of that type.
+	skipCode bool
 }
 
 type Package struct {
@@ -266,8 +270,9 @@ func (g *Generator) addPackage(pkg *packages.Package) {
 
 	for i, file := range pkg.Syntax {
 		g.pkg.files[i] = &File{
-			file: file,
-			pkg:  g.pkg,
+			file:     file,
+			pkg:      g.pkg,
+			skipCode: g.skipCode,
 		}
 	}
 }
@@ -498,8 +503,11 @@ func (f *File) genDecl(node ast.Node) bool {
 				names := r.FindAllString(strings.TrimSpace(c.Text()), -1)
 				if len(names) > 0 {
 					v.codeName = strings.Trim(names[0], "\"")
+					if f.skipCode {
+						v.cnName = v.codeName
+					}
 				}
-				if len(names) > 1 {
+				if !f.skipCode && len(names) > 1 {
 					v.cnName = strings.Trim(names[1], "\"")
 				}
 			}
@@ -755,6 +763,10 @@ const stringMap = `func (i %[1]s) %[2]s() string {
 `
 
 func (g *Generator) code2ID(runs [][]Value, typeName string) {
+	if g.code2IDFnName == "-" {
+		return
+	}
+
 	g.Printf("\n")
 	g.Printf("\nvar _%s%s = map[string]%s{\n", typeName, DefCode2IDMap, typeName)
 	n := 0
@@ -776,6 +788,10 @@ func (g *Generator) code2ID(runs [][]Value, typeName string) {
 }
 
 func (g *Generator) code2ID2(runs [][]Value, typeName string) {
+	if g.code2IDFnName == "-" {
+		return
+	}
+
 	g.Printf("\n")
 	g.Printf("\nvar _%s%s = map[string]%s{\n", typeName, DefCode2IDMap, typeName)
 	n := 0
